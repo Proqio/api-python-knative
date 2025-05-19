@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "api-python-sensor-sample"
-version = "0.1.0"
+version = "0.1.1"
 description = "Proqio API Sensor Sample"
 authors = ["Daniel Popoola <daniel.popoola@proqio.com>"]
 packages = [

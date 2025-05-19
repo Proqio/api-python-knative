@@ -25,4 +25,3 @@ vault_client = hvac.Client(url=vault_addr, token=vault_token)
 vault_client.is_authenticated()
 
 vault_engine_name: str = f"proqio-mlops-{environment}"
-

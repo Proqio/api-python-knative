@@ -14,10 +14,7 @@ from app._environment_variables import (
 if environment == Environment.CENTRAL:
     from app.routers import healthz
 else:
-    from app.routers import (
-        healthz,
-        sample
-)
+    from app.routers import healthz, sample
 
 
 def get_version() -> str:
