@@ -1,0 +1,39 @@
+[tool.poetry]
+name = "api-python-sensor-sample"
+version = "0.1.0"
+description = "Proqio API Sensor Sample"
+authors = ["Daniel Popoola <daniel.popoola@proqio.com>"]
+packages = [
+    { include = "app" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+python-decouple = "3.8"
+fastapi = {extras = ["standard"], version = "0.115.*"}
+hvac = "2.3.*"
+types-hvac = "2.3.*"
+python-multipart = "0.0.*"
+toml = "0.10.*"
+pyarrow = "19.0.*"
+dac = {version = "0.26.*", source = "proqio"}
+dac-qdrant = {version = "0.2.*", source = "proqio"}
+
+[tool.poetry.group.dev.dependencies]
+coverage = {extras = ["toml"], version = "7.7.*"}
+black = {version = "25.1.*", allow-prereleases = true}
+pytest = "8.3.*"
+pytest-html = "4.1.*"
+pytest-cov = "6.0.*"
+pylint = "3.3.*"
+mkdocs = "1.6.*"
+httpx = "0.28.*"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[[tool.poetry.source]]
+name = "proqio"
+url = "https://pypiserver.central.proqioai.com"
+priority = "explicit"

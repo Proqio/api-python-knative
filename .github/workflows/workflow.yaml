@@ -1,0 +1,428 @@
+name: CICD - Workflow
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+env:
+  PROJECT_FOLDER: "app"
+  PYLINT_THRESHOLD: "0"
+  POETRY_VERSION: "2.1.1"
+  POETRY_REPOSITORY: "proqio"
+  PYTHON_VERSION: "3.12"
+  DOCKER_IMAGE_NAME: ${{ github.event.repository.name }}
+  DOCKER_IMAGE_TAG: ${{ github.sha }}
+  DOCKER_USERNAME: "oauth2accesstoken"
+  DEBIAN_VERSION: "bookworm"
+  KUBERNETES_NAMESPACE: "api"
+  KUBERNETES_DEPLOYMENT: ${{ github.event.repository.name }}
+  VAULT_CENTRAL_ENGINE_NAME: "proqio-mlops-central"
+  VAULT_DEV_ENGINE_NAME: "proqio-mlops-dev"
+  VAULT_PROD_ENGINE_NAME: "proqio-mlops-prod"
+jobs:
+  install-test-coverage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: "postgres"
+          POSTGRES_PASSWORD: "example"
+          POSTGRES_DB: "postgres"
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_PASSWORD | PIPSERVER_PASSWORD ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_URL | PIPSERVER_URL ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_USERNAME | PIPSERVER_USERNAME ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/sonarqube SONAR_HOST_URL | SONAR_HOST_URL ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/sonarqube SONAR_TOKEN | SONAR_TOKEN ;
+      - name: Map secrets to GitHub env
+        run: |
+          echo "PIPSERVER_PASSWORD=${PIPSERVER_PASSWORD}" >> $GITHUB_ENV
+          echo "PIPSERVER_URL=${PIPSERVER_URL}" >> $GITHUB_ENV
+          echo "PIPSERVER_USERNAME=${PIPSERVER_USERNAME}" >> $GITHUB_ENV
+          echo "SONAR_HOST_URL=${SONAR_HOST_URL}" >> $GITHUB_ENV
+          echo "SONAR_TOKEN=${SONAR_TOKEN}" >> $GITHUB_ENV
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup python versions
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v4
+        with:
+          poetry-version: ${{ env.POETRY_VERSION }}
+      - name: Configure Poetry
+        run: |
+          poetry config repositories.${{ env.POETRY_REPOSITORY }} ${{ env.PIPSERVER_URL }}
+          poetry config http-basic.${{ env.POETRY_REPOSITORY }} ${{ env.PIPSERVER_USERNAME }} ${{ env.PIPSERVER_PASSWORD }}
+      - name: Install Python dependencies
+        run: poetry install
+      - name: Code quality
+        run: poetry run pylint --fail-under=${{ env.PYLINT_THRESHOLD }} **/*.py
+      - name: Test & Generate Coverage Report
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          ENVIRONMENT: "cicd"
+        run: |
+          poetry run coverage run --source ${{ env.PROJECT_FOLDER }}/ -m pytest --junitxml=pytest.xml
+          poetry run coverage xml
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v2
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.DOCKER_IMAGE_NAME }}
+            -Dsonar.organization=${{ github.repository_owner }}
+            -Dsonar.sources=${{ env.PROJECT_FOLDER }}
+            -Dsonar.exclusions=.venv,build,dist,*.egg-info,tests
+            -Dsonar.sourceEncoding=UTF-8
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.python.xunit.reportPath=pytest.xml
+            -Dsonar.python.version=${{ env.PYTHON_VERSION }}
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+  publish-in-pypiserver:
+    runs-on: ubuntu-latest
+    needs: [install-test-coverage]
+    if: contains(github.event.head_commit.message, 'publish')
+    steps:
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_PASSWORD | PIPSERVER_PASSWORD ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_URL | PIPSERVER_URL ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_USERNAME | PIPSERVER_USERNAME ;
+      - name: Map secrets to GitHub env
+        run: |
+          echo "PIPSERVER_PASSWORD=${PIPSERVER_PASSWORD}" >> $GITHUB_ENV
+          echo "PIPSERVER_URL=${PIPSERVER_URL}" >> $GITHUB_ENV
+          echo "PIPSERVER_USERNAME=${PIPSERVER_USERNAME}" >> $GITHUB_ENV
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup python versions
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v4
+        with:
+          poetry-version: ${{ env.POETRY_VERSION }}
+      - name: Configure Poetry
+        run: |
+          poetry config repositories.${{ env.POETRY_REPOSITORY }} ${{ env.PIPSERVER_URL }}
+          poetry config http-basic.${{ env.POETRY_REPOSITORY }} ${{ env.PIPSERVER_USERNAME }} ${{ env.PIPSERVER_PASSWORD }}
+      - name: Pypiserver Publish
+        run: poetry publish -r ${{ env.POETRY_REPOSITORY }} --build
+  create-tag-and-branch:
+    runs-on: ubuntu-latest
+    needs: [install-test-coverage]
+    if: contains(github.event.head_commit.message, 'publish')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup python versions
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v4
+        with:
+          poetry-version: ${{ env.POETRY_VERSION }}
+      - name: Create package version environment variable
+        run: echo "PACKAGE_VERSION=v$(poetry version | awk '{print $2}')" >> $GITHUB_ENV
+      - uses: rickstaa/action-create-tag@v1
+        with:
+          tag: ${{ env.PACKAGE_VERSION }}
+      - name: Create branch
+        uses: peterjgrainger/action-create-branch@v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          branch: ${{ env.PACKAGE_VERSION }}
+          sha: '${{ github.event.pull_request.head.sha }}'
+  build-and-push-docker-image: # TO DELETE
+    runs-on: ubuntu-latest
+    needs: [install-test-coverage]
+    if: contains(github.event.head_commit.message, 'cd run')
+    steps:
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            proqio-central/data/pypiserver PIPSERVER_PASSWORD | PIPSERVER_PASSWORD ;
+            proqio-central/data/pypiserver PIPSERVER_URL | PIPSERVER_URL ;
+            proqio-central/data/pypiserver PIPSERVER_USERNAME | PIPSERVER_USERNAME ;
+            proqio-central/data/aws AWS_ACCESS_KEY_ID | AWS_ACCESS_KEY_ID ;
+            proqio-central/data/aws AWS_SECRET_ACCESS_KEY | AWS_SECRET_ACCESS_KEY ;
+            proqio-central/data/aws AWS_REGION | AWS_REGION ;
+            proqio-dev/data/aws AWS_ACCOUNT_ID | AWS_ACCOUNT_ID ;
+      - name: Map secrets to GitHub env
+        run: |
+          echo "PIPSERVER_PASSWORD=${PIPSERVER_PASSWORD}" >> $GITHUB_ENV
+          echo "PIPSERVER_URL=${PIPSERVER_URL}" >> $GITHUB_ENV
+          echo "PIPSERVER_USERNAME=${PIPSERVER_USERNAME}" >> $GITHUB_ENV
+          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> $GITHUB_ENV
+          echo "AWS_REGION=${AWS_REGION}" >> $GITHUB_ENV
+          echo "AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}" >> $GITHUB_ENV
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup python versions
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v4
+        with:
+          poetry-version: ${{ env.POETRY_VERSION }}
+      - name: Create Docker registry environment variable
+        run: |
+          echo "DOCKER_REGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> $GITHUB_ENV
+      - name: Create package version environment variable
+        run: echo "PACKAGE_VERSION=v$(poetry version | awk '{print $2}')" >> $GITHUB_ENV
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Configure AWS ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+      - name: Create AWS ECR repository
+        run: |
+          aws ecr create-repository --repository-name ${{ env.DOCKER_IMAGE_NAME }} || true
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+      - name: Get AWS account ID
+        run: aws sts get-caller-identity
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          builder: ${{ steps.buildx.outputs.name }}
+          push: true
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_IMAGE_TAG }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.PACKAGE_VERSION }}
+          build-args: |
+            PIPSERVER_URL=${{ env.PIPSERVER_URL }}
+            PIPSERVER_USERNAME=${{ env.PIPSERVER_USERNAME }}
+            PIPSERVER_PASSWORD=${{ env.PIPSERVER_PASSWORD }}
+            POETRY_VERSION=${{ env.POETRY_VERSION }}
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            POETRY_REPOSITORY=${{ env.POETRY_REPOSITORY }}
+            DEBIAN_VERSION=${{ env.DEBIAN_VERSION }}
+  build-and-push-docker-image-dev:
+    runs-on: ubuntu-latest
+    needs: [install-test-coverage]
+    if: contains(github.event.head_commit.message, 'cd run AWS') && contains(github.event.head_commit.message, 'DEV')
+    steps:
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_PASSWORD | PIPSERVER_PASSWORD ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_URL | PIPSERVER_URL ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_USERNAME | PIPSERVER_USERNAME ;
+            ${{ env.VAULT_DEV_ENGINE_NAME }}/data/aws AWS_ACCESS_KEY_ID | AWS_ACCESS_KEY_ID ;
+            ${{ env.VAULT_DEV_ENGINE_NAME }}/data/aws AWS_SECRET_ACCESS_KEY | AWS_SECRET_ACCESS_KEY ;
+            ${{ env.VAULT_DEV_ENGINE_NAME }}/data/aws AWS_REGION | AWS_REGION ;
+            ${{ env.VAULT_DEV_ENGINE_NAME }}/data/aws AWS_ACCOUNT_ID | AWS_ACCOUNT_ID ;
+      - name: Map secrets to GitHub env
+        run: |
+          echo "PIPSERVER_PASSWORD=${PIPSERVER_PASSWORD}" >> $GITHUB_ENV
+          echo "PIPSERVER_URL=${PIPSERVER_URL}" >> $GITHUB_ENV
+          echo "PIPSERVER_USERNAME=${PIPSERVER_USERNAME}" >> $GITHUB_ENV
+          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> $GITHUB_ENV
+          echo "AWS_REGION=${AWS_REGION}" >> $GITHUB_ENV
+          echo "AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}" >> $GITHUB_ENV
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup python versions
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v4
+        with:
+          poetry-version: ${{ env.POETRY_VERSION }}
+      - name: Create Docker registry environment variable
+        run: |
+          echo "DOCKER_REGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> $GITHUB_ENV
+      - name: Create package version environment variable
+        run: echo "PACKAGE_VERSION=v$(poetry version | awk '{print $2}')" >> $GITHUB_ENV
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Configure AWS ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+      - name: Create AWS ECR repository
+        run: |
+          aws ecr create-repository --repository-name ${{ env.DOCKER_IMAGE_NAME }} || true
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+      - name: Get AWS account ID
+        run: aws sts get-caller-identity
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          builder: ${{ steps.buildx.outputs.name }}
+          push: true
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_IMAGE_TAG }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.PACKAGE_VERSION }}
+          build-args: |
+            PIPSERVER_URL=${{ env.PIPSERVER_URL }}
+            PIPSERVER_USERNAME=${{ env.PIPSERVER_USERNAME }}
+            PIPSERVER_PASSWORD=${{ env.PIPSERVER_PASSWORD }}
+            POETRY_VERSION=${{ env.POETRY_VERSION }}
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            POETRY_REPOSITORY=${{ env.POETRY_REPOSITORY }}
+            DEBIAN_VERSION=${{ env.DEBIAN_VERSION }}
+  build-and-push-docker-image-prod:
+    runs-on: ubuntu-latest
+    needs: [install-test-coverage]
+    if: contains(github.event.head_commit.message, 'cd run AWS') && contains(github.event.head_commit.message, 'PROD')
+    steps:
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          token: ${{ secrets.VAULT_TOKEN }}
+          secrets: |
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_PASSWORD | PIPSERVER_PASSWORD ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_URL | PIPSERVER_URL ;
+            ${{ env.VAULT_CENTRAL_ENGINE_NAME }}/data/pypiserver PIPSERVER_USERNAME | PIPSERVER_USERNAME ;
+            ${{ env.VAULT_PROD_ENGINE_NAME }}/data/aws AWS_ACCESS_KEY_ID | AWS_ACCESS_KEY_ID ;
+            ${{ env.VAULT_PROD_ENGINE_NAME }}/data/aws AWS_SECRET_ACCESS_KEY | AWS_SECRET_ACCESS_KEY ;
+            ${{ env.VAULT_PROD_ENGINE_NAME }}/data/aws AWS_REGION | AWS_REGION ;
+            ${{ env.VAULT_PROD_ENGINE_NAME }}/data/aws AWS_ACCOUNT_ID | AWS_ACCOUNT_ID ;
+      - name: Map secrets to GitHub env
+        run: |
+          echo "PIPSERVER_PASSWORD=${PIPSERVER_PASSWORD}" >> $GITHUB_ENV
+          echo "PIPSERVER_URL=${PIPSERVER_URL}" >> $GITHUB_ENV
+          echo "PIPSERVER_USERNAME=${PIPSERVER_USERNAME}" >> $GITHUB_ENV
+          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> $GITHUB_ENV
+          echo "AWS_REGION=${AWS_REGION}" >> $GITHUB_ENV
+          echo "AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}" >> $GITHUB_ENV
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup python versions
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install Poetry
+        uses: abatilo/actions-poetry@v4
+        with:
+          poetry-version: ${{ env.POETRY_VERSION }}
+      - name: Create Docker registry environment variable
+        run: |
+          echo "DOCKER_REGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> $GITHUB_ENV
+      - name: Create package version environment variable
+        run: echo "PACKAGE_VERSION=v$(poetry version | awk '{print $2}')" >> $GITHUB_ENV
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Configure AWS ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+      - name: Create AWS ECR repository
+        run: |
+          aws ecr create-repository --repository-name ${{ env.DOCKER_IMAGE_NAME }} || true
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+      - name: Get AWS account ID
+        run: aws sts get-caller-identity
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          builder: ${{ steps.buildx.outputs.name }}
+          push: true
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.DOCKER_IMAGE_TAG }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE_NAME }}:${{ env.PACKAGE_VERSION }}
+          build-args: |
+            PIPSERVER_URL=${{ env.PIPSERVER_URL }}
+            PIPSERVER_USERNAME=${{ env.PIPSERVER_USERNAME }}
+            PIPSERVER_PASSWORD=${{ env.PIPSERVER_PASSWORD }}
+            POETRY_VERSION=${{ env.POETRY_VERSION }}
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            POETRY_REPOSITORY=${{ env.POETRY_REPOSITORY }}
+            DEBIAN_VERSION=${{ env.DEBIAN_VERSION }}
